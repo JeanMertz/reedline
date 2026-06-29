@@ -87,6 +87,11 @@ pub enum W {
     // Constructed only in non-test builds; under `cfg(test)` we always use `Sink`.
     #[cfg_attr(test, allow(dead_code))]
     Terminal(std::io::BufWriter<std::io::Stderr>),
+    /// A caller-supplied writer injected via [`crate::Reedline::with_output`].
+    ///
+    /// Lets the host render prompts to a stream of its choosing (e.g. a
+    /// `/dev/tty` handle), so prompts survive `stdout`/`stderr` redirection.
+    Boxed(std::io::BufWriter<Box<dyn std::io::Write + Send>>),
     /// Discards all output, used in tests.
     #[cfg(test)]
     Sink(std::io::Sink),
@@ -102,6 +107,16 @@ impl W {
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn terminal() -> Self {
         W::Terminal(std::io::BufWriter::new(std::io::stderr()))
+    }
+
+    /// Writer targeting a caller-supplied stream (e.g. a `/dev/tty` handle).
+    pub(crate) fn boxed(writer: Box<dyn std::io::Write + Send>) -> Self {
+        W::Boxed(std::io::BufWriter::new(writer))
+    }
+
+    /// Whether output targets a caller-supplied writer.
+    pub(crate) fn is_external(&self) -> bool {
+        matches!(self, W::Boxed(_))
     }
 
     /// Writer that discards everything, for tests that exercise painting
@@ -132,6 +147,7 @@ impl Write for W {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         match self {
             W::Terminal(w) => w.write(buf),
+            W::Boxed(w) => w.write(buf),
             #[cfg(test)]
             W::Sink(w) => w.write(buf),
             #[cfg(test)]
@@ -142,12 +158,70 @@ impl Write for W {
     fn flush(&mut self) -> Result<()> {
         match self {
             W::Terminal(w) => w.flush(),
+            W::Boxed(w) => w.flush(),
             #[cfg(test)]
             W::Sink(w) => w.flush(),
             #[cfg(test)]
             W::Capture(w) => w.flush(),
         }
     }
+}
+
+/// Read an `ESC [ <row> ; <col> R` cursor-position report from `/dev/tty`.
+///
+/// Paired with a query written to the painter's output writer, so the probe
+/// works when reedline renders to a stream other than stdout. Blocks until the
+/// terminal replies; interactive terminals always answer the DSR query.
+#[cfg(unix)]
+fn read_cursor_report_from_tty() -> Result<(u16, u16)> {
+    use std::io::Read;
+
+    let mut tty = std::fs::OpenOptions::new().read(true).open("/dev/tty")?;
+    let mut buf = Vec::with_capacity(16);
+    let mut byte = [0u8; 1];
+    loop {
+        if tty.read(&mut byte)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "tty closed before cursor position report",
+            ));
+        }
+        buf.push(byte[0]);
+        if byte[0] == b'R' {
+            break;
+        }
+        if buf.len() > 32 {
+            return Err(cursor_report_error());
+        }
+    }
+    parse_cursor_report(&buf)
+}
+
+#[cfg(unix)]
+fn cursor_report_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "invalid cursor position report",
+    )
+}
+
+/// Parse `ESC [ <row> ; <col> R` into a 0-based `(column, row)` pair, matching
+/// [`crossterm::cursor::position`].
+#[cfg(unix)]
+fn parse_cursor_report(buf: &[u8]) -> Result<(u16, u16)> {
+    let esc = buf
+        .iter()
+        .rposition(|&b| b == 0x1b)
+        .ok_or_else(cursor_report_error)?;
+    let body = std::str::from_utf8(&buf[esc..])
+        .map_err(|_| cursor_report_error())?
+        .strip_prefix("\x1b[")
+        .and_then(|s| s.strip_suffix('R'))
+        .ok_or_else(cursor_report_error)?;
+    let (row, col) = body.split_once(';').ok_or_else(cursor_report_error)?;
+    let row: u16 = row.trim().parse().map_err(|_| cursor_report_error())?;
+    let col: u16 = col.trim().parse().map_err(|_| cursor_report_error())?;
+    Ok((col.saturating_sub(1), row.saturating_sub(1)))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -306,6 +380,40 @@ impl Painter {
             semantic_markers: None,
             last_layout: None,
         }
+    }
+
+    /// Replace the output writer, preserving all other painter state.
+    pub(crate) fn set_output(&mut self, stdout: W) {
+        self.stdout = stdout;
+    }
+
+    /// Mutable access to the output writer, so terminal-control escapes can be
+    /// routed through the same stream the painter renders to.
+    pub(crate) fn output_mut(&mut self) -> &mut W {
+        &mut self.stdout
+    }
+
+    /// Whether the painter renders to a caller-supplied writer.
+    pub(crate) fn is_external_output(&self) -> bool {
+        self.stdout.is_external()
+    }
+
+    /// Query the terminal for the cursor position.
+    ///
+    /// `crossterm::cursor::position` writes its `ESC[6n` query to *stdout*,
+    /// which corrupts a redirected stdout (e.g. `… | jq`) and never reaches the
+    /// terminal. When rendering to a caller-supplied writer we send the query
+    /// through that writer instead and read the reply from `/dev/tty`.
+    fn query_cursor_position(&mut self) -> std::io::Result<(u16, u16)> {
+        #[cfg(unix)]
+        if self.stdout.is_external() {
+            use std::io::Write as _;
+            self.stdout.write_all(b"\x1b[6n")?;
+            self.stdout.flush()?;
+            return read_cursor_report_from_tty();
+        }
+
+        cursor::position()
     }
 
     /// Height of the current terminal window
@@ -471,7 +579,7 @@ impl Painter {
                 size
             }
         };
-        let prompt_selector = select_prompt_row(suspended_state, cursor::position()?);
+        let prompt_selector = select_prompt_row(suspended_state, self.query_cursor_position()?);
         let new_row = match prompt_selector {
             PromptRowSelector::UseExistingPrompt { start_row } => start_row,
             PromptRowSelector::MakeNewPrompt { new_row } => {
@@ -561,7 +669,7 @@ impl Painter {
         // the query confirms no drift, so later paints can skip it.
         let should_reset_anchor = match self.prompt_start_row {
             PromptStartRow::Verified(_) => false,
-            PromptStartRow::Stale(row) => match cursor::position() {
+            PromptStartRow::Stale(row) => match self.query_cursor_position() {
                 // The `+1` handles the case where the previous output
                 // ended without a newline, leaving the cursor on the
                 // same row as the next prompt.
@@ -1074,7 +1182,7 @@ impl Painter {
         // bug.
         #[cfg(not(test))]
         {
-            if let Ok(position) = cursor::position() {
+            if let Ok(position) = self.query_cursor_position() {
                 self.prompt_start_row = PromptStartRow::Stale(position.1);
                 self.just_resized = true;
             }

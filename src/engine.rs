@@ -307,6 +307,18 @@ impl Reedline {
         }
     }
 
+    /// Render reedline's output to a caller-supplied writer instead of the
+    /// default buffered stderr.
+    ///
+    /// Hosts point reedline at a stream they control (e.g. a `/dev/tty` handle),
+    /// so prompts survive `stdout`/`stderr` redirection. The writer is owned by
+    /// reedline; all other painter state is preserved.
+    #[must_use]
+    pub fn with_output(mut self, output: Box<dyn std::io::Write + Send>) -> Self {
+        self.painter.set_output(W::boxed(output));
+        self
+    }
+
     /// Get a new history session id based on the current time and the first commit datetime of reedline
     pub fn create_history_session_id() -> Option<HistorySessionId> {
         let nanos = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
@@ -340,7 +352,15 @@ impl Reedline {
     ///
     /// Read more: <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>
     pub fn use_kitty_keyboard_enhancement(mut self, enable: bool) -> Self {
-        self.kitty_protocol.set(enable);
+        // Querying terminal support writes to stdout; when output is routed to a
+        // caller-supplied writer, skip the query and push the (harmlessly
+        // ignored) flags unconditionally so a redirected stdout isn't corrupted.
+        // Call `with_output` before this for it to take effect.
+        if self.painter.is_external_output() {
+            self.kitty_protocol.set_force(enable);
+        } else {
+            self.kitty_protocol.set(enable);
+        }
         self
     }
 
@@ -784,13 +804,27 @@ impl Reedline {
     /// and the `Ok` variant wraps a [`Signal`] which handles user inputs.
     pub fn read_line(&mut self, prompt: &dyn Prompt) -> Result<Signal> {
         terminal::enable_raw_mode()?;
-        self.bracketed_paste.enter();
-        self.kitty_protocol.enter();
+        // When rendering to a caller-supplied writer, route the terminal-mode
+        // escapes (kitty enhancement, bracketed paste) through it too, so they
+        // reach the terminal instead of a possibly-redirected stdout.
+        let external = self.painter.is_external_output();
+        if external {
+            self.bracketed_paste.enter(Some(self.painter.output_mut()));
+            self.kitty_protocol.enter(Some(self.painter.output_mut()));
+        } else {
+            self.bracketed_paste.enter(None);
+            self.kitty_protocol.enter(None);
+        }
 
         let result = self.read_line_helper(prompt);
 
-        self.bracketed_paste.exit();
-        self.kitty_protocol.exit();
+        if external {
+            self.bracketed_paste.exit(Some(self.painter.output_mut()));
+            self.kitty_protocol.exit(Some(self.painter.output_mut()));
+        } else {
+            self.bracketed_paste.exit(None);
+            self.kitty_protocol.exit(None);
+        }
         terminal::disable_raw_mode()?;
         result
     }

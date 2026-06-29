@@ -1,4 +1,6 @@
-use crossterm::{event, execute};
+use std::io::Write;
+
+use crossterm::{event, execute, QueueableCommand};
 
 /// Helper managing proper setup and teardown of bracketed paste mode
 ///
@@ -13,15 +15,31 @@ impl BracketedPasteGuard {
     pub fn set(&mut self, enable: bool) {
         self.enabled = enable;
     }
-    pub fn enter(&mut self) {
+    pub fn enter(&mut self, out: Option<&mut dyn Write>) {
         if self.enabled && !self.active {
-            let _ = execute!(std::io::stdout(), event::EnableBracketedPaste);
+            match out {
+                Some(w) => {
+                    let _ = w.queue(event::EnableBracketedPaste).and_then(|w| w.flush());
+                }
+                None => {
+                    let _ = execute!(std::io::stdout(), event::EnableBracketedPaste);
+                }
+            }
             self.active = true;
         }
     }
-    pub fn exit(&mut self) {
+    pub fn exit(&mut self, out: Option<&mut dyn Write>) {
         if self.active {
-            let _ = execute!(std::io::stdout(), event::DisableBracketedPaste);
+            match out {
+                Some(w) => {
+                    let _ = w
+                        .queue(event::DisableBracketedPaste)
+                        .and_then(|w| w.flush());
+                }
+                None => {
+                    let _ = execute!(std::io::stdout(), event::DisableBracketedPaste);
+                }
+            }
             self.active = false;
         }
     }

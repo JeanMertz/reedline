@@ -1,4 +1,6 @@
-use crossterm::{event, execute};
+use std::io::Write;
+
+use crossterm::{event, execute, QueueableCommand};
 
 /// Helper managing proper setup and teardown of the kitty keyboard enhancement protocol
 ///
@@ -31,21 +33,46 @@ impl KittyProtocolGuard {
 
         self.enabled = enable && self.support_kitty_protocol.unwrap_or(false);
     }
-    pub fn enter(&mut self) {
-        if self.enabled && !self.active {
-            let _ = execute!(
-                std::io::stdout(),
-                event::PushKeyboardEnhancementFlags(
-                    event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                )
-            );
 
+    /// Enable/disable without querying the terminal for support.
+    ///
+    /// The support query (`kitty_protocol_available`) writes to stdout, which a
+    /// redirected stdout can't tolerate; used when output is routed to a
+    /// caller-supplied writer. The enhancement flags are ignored by terminals
+    /// that don't understand them, so pushing them unconditionally is safe.
+    pub fn set_force(&mut self, enable: bool) {
+        self.enabled = enable;
+        self.support_kitty_protocol = Some(enable);
+    }
+
+    pub fn enter(&mut self, out: Option<&mut dyn Write>) {
+        if self.enabled && !self.active {
+            let command = event::PushKeyboardEnhancementFlags(
+                event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+            );
+            match out {
+                Some(w) => {
+                    let _ = w.queue(command).and_then(|w| w.flush());
+                }
+                None => {
+                    let _ = execute!(std::io::stdout(), command);
+                }
+            }
             self.active = true;
         }
     }
-    pub fn exit(&mut self) {
+    pub fn exit(&mut self, out: Option<&mut dyn Write>) {
         if self.active {
-            let _ = execute!(std::io::stdout(), event::PopKeyboardEnhancementFlags);
+            match out {
+                Some(w) => {
+                    let _ = w
+                        .queue(event::PopKeyboardEnhancementFlags)
+                        .and_then(|w| w.flush());
+                }
+                None => {
+                    let _ = execute!(std::io::stdout(), event::PopKeyboardEnhancementFlags);
+                }
+            }
             self.active = false;
         }
     }
