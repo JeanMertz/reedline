@@ -48,7 +48,7 @@ impl BracketedPasteGuard {
 impl Drop for BracketedPasteGuard {
     fn drop(&mut self) {
         if self.active {
-            let _ = execute!(std::io::stdout(), event::DisableBracketedPaste);
+            super::emergency_teardown(event::DisableBracketedPaste);
         }
     }
 }

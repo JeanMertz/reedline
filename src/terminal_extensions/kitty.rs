@@ -81,7 +81,7 @@ impl KittyProtocolGuard {
 impl Drop for KittyProtocolGuard {
     fn drop(&mut self) {
         if self.active {
-            let _ = execute!(std::io::stdout(), event::PopKeyboardEnhancementFlags);
+            super::emergency_teardown(event::PopKeyboardEnhancementFlags);
         }
     }
 }
